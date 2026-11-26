@@ -179,6 +179,12 @@ async fn acquire_upstream_response(
             let project = account_manager
                 .get_project_for_account(&account, &token)
                 .await;
+            if account_manager.is_account_invalid(&account.email).await {
+                return Err(NovoidError::AccountForbidden {
+                    message: format!("Account {} requires verification", account.email),
+                    account_email: Some(account.email.clone()),
+                });
+            }
             let (payload, session_id) =
                 build_cloudcode_request(anthropic_request, &project, &account.email);
 

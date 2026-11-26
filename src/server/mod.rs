@@ -661,12 +661,24 @@ async fn handle_account_limits(
                         let existing_pid = acc
                             .subscription
                             .project_id
-                            .as_deref()
-                            .or(acc.project_id.as_deref());
-                        tokio::join!(
-                            get_subscription_tier(&token),
-                            get_model_quotas(&token, existing_pid)
-                        )
+                            .clone()
+                            .or_else(|| acc.project_id.clone());
+                        if let Some(ref pid) = existing_pid {
+                            tokio::join!(
+                                get_subscription_tier(&token),
+                                get_model_quotas(&token, Some(pid.as_str()))
+                            )
+                        } else {
+                            let s_res = get_subscription_tier(&token).await;
+                            match &s_res {
+                                Ok((_, detected_pid)) => {
+                                    let q_res =
+                                        get_model_quotas(&token, detected_pid.as_deref()).await;
+                                    (s_res, q_res)
+                                }
+                                Err(_) => (s_res, Ok(HashMap::new())),
+                            }
+                        }
                     };
 
                     let sub = match sub_res {
@@ -687,6 +699,26 @@ async fn handle_account_limits(
                                     acc.email,
                                     "banned".to_string(),
                                     Some("Account banned — Gemini disabled for Terms of Service violation".to_string()),
+                                    acc.subscription,
+                                    HashMap::new(),
+                                );
+                            }
+                            if let Some(vurl_raw) = err.strip_prefix("VALIDATION_REQUIRED|") {
+                                let vurl = if vurl_raw.is_empty() {
+                                    None
+                                } else {
+                                    Some(vurl_raw.to_string())
+                                };
+                                am.mark_invalid(
+                                    &acc.email,
+                                    "Account requires verification",
+                                    vurl,
+                                )
+                                .await;
+                                return (
+                                    acc.email,
+                                    "invalid".to_string(),
+                                    Some("Account requires verification".to_string()),
                                     acc.subscription,
                                     HashMap::new(),
                                 );

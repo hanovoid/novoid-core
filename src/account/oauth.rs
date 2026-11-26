@@ -383,17 +383,26 @@ pub fn get_default_tier_id(allowed_tiers: Option<&Value>) -> Option<String> {
     if arr.is_empty() {
         return None;
     }
+    let is_managed_tier = |t: &Value| {
+        t.get("userDefinedCloudaicompanionProject")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+    };
     for t in arr {
-        if t.get("isDefault").and_then(|v| v.as_bool()) == Some(true) {
+        if is_managed_tier(t) && t.get("isDefault").and_then(|v| v.as_bool()) == Some(true) {
             if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
                 return Some(id.to_string());
             }
         }
     }
-    arr[0]
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    for t in arr {
+        if is_managed_tier(t) {
+            if let Some(id) = t.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub async fn onboard_user(

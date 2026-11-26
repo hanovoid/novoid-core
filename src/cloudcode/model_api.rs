@@ -1,6 +1,7 @@
 use crate::account::types::ModelQuota;
 use crate::account::AccountManager;
 use crate::cloudcode::model_registry::record_models;
+use crate::cloudcode::rate_limit_state::{extract_verification_url, is_validation_required};
 use crate::constants::{
     antigravity_headers, client_metadata, get_model_family, ANTIGRAVITY_ENDPOINT_FALLBACKS,
     LOAD_CODE_ASSIST_ENDPOINTS, MODEL_VALIDATION_CACHE_TTL_MS,
@@ -204,10 +205,13 @@ pub async fn populate_model_cache_for_accounts(
                 .clone()
                 .or_else(|| acc.project_id.clone());
             if project_id.is_none() {
-                project_id = Some(
-                    am.get_project_for_account_with_onboard(&acc, &token, false)
-                        .await,
-                );
+                let discovered = am
+                    .get_project_for_account_with_onboard(&acc, &token, false)
+                    .await;
+                if am.is_account_invalid(&acc.email).await {
+                    return None;
+                }
+                project_id = Some(discovered);
             }
             let data = fetch_available_models(&token, project_id.as_deref())
                 .await
@@ -436,13 +440,51 @@ pub fn parse_tier_id(tier_id: &str) -> String {
     let lower = tier_id.to_lowercase();
     if lower.contains("ultra") {
         "ultra".to_string()
-    } else if lower == "standard-tier" || lower.contains("pro") || lower.contains("premium") {
+    } else if lower == "standard-tier"
+        || lower.contains("pro")
+        || lower.contains("plus")
+        || lower.contains("premium")
+    {
         "pro".to_string()
     } else if lower == "free-tier" || lower.contains("free") {
         "free".to_string()
     } else {
         "unknown".to_string()
     }
+}
+
+pub fn extract_ineligible_validation(data: &Value) -> Option<(String, Option<String>)> {
+    let has_project = data
+        .get("cloudaicompanionProject")
+        .and_then(|v| v.as_str().or_else(|| v.get("id").and_then(|i| i.as_str())))
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if has_project || data.get("currentTier").is_some() {
+        return None;
+    }
+    let arr = data.get("ineligibleTiers")?.as_array()?;
+    for item in arr {
+        let code = item
+            .get("reasonCode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let verify_url = item
+            .get("validationUrl")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        if code.eq_ignore_ascii_case("VALIDATION_REQUIRED") || verify_url.is_some() {
+            let reason = item
+                .get("validationErrorMessage")
+                .or_else(|| item.get("reasonMessage"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Account requires verification")
+                .to_string();
+            return Some((reason, verify_url));
+        }
+    }
+    None
 }
 
 pub async fn get_subscription_tier(token: &str) -> Result<(String, Option<String>), String> {
@@ -472,10 +514,21 @@ pub async fn get_subscription_tier(token: &str) -> Result<(String, Option<String
                         {
                             return Err(format!("ACCOUNT_BANNED: {err_text}"));
                         }
+                        if is_validation_required(&err_text) {
+                            let vurl = extract_verification_url(&err_text).unwrap_or_default();
+                            return Err(format!("VALIDATION_REQUIRED|{vurl}"));
+                        }
                     }
                     continue;
                 }
                 if let Ok(data) = r.json::<Value>().await {
+                    if let Some((_reason, verify_url)) = extract_ineligible_validation(&data) {
+                        return Err(format!(
+                            "VALIDATION_REQUIRED|{}",
+                            verify_url.unwrap_or_default()
+                        ));
+                    }
+
                     let project_id = data.get("cloudaicompanionProject").and_then(|v| {
                         v.as_str()
                             .map(|s| s.to_string())
@@ -501,12 +554,22 @@ pub async fn get_subscription_tier(token: &str) -> Result<(String, Option<String
                     }
                     if tier == "unknown" {
                         if let Some(allowed) = data.get("allowedTiers").and_then(|v| v.as_array()) {
-                            let target = allowed
+                            let eligible: Vec<&Value> = allowed
                                 .iter()
+                                .filter(|t| {
+                                    project_id.is_some()
+                                        || t.get("userDefinedCloudaicompanionProject")
+                                            .and_then(|v| v.as_bool())
+                                            != Some(true)
+                                })
+                                .collect();
+                            let target = eligible
+                                .iter()
+                                .copied()
                                 .find(|t| {
                                     t.get("isDefault").and_then(|v| v.as_bool()) == Some(true)
                                 })
-                                .or_else(|| allowed.first());
+                                .or_else(|| eligible.first().copied());
                             if let Some(id) =
                                 target.and_then(|t| t.get("id")).and_then(|v| v.as_str())
                             {

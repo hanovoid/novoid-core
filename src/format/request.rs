@@ -201,32 +201,52 @@ pub fn convert_anthropic_to_google(anthropic_request: &Value) -> Value {
                 }),
             );
         } else if is_gemini_model {
-            let requested_budget = if let Some(b) = explicit_budget {
-                clamp_gemini_thinking_budget(model_name, Some(b))
-            } else if max_tokens.map(|m| m <= 1024).unwrap_or(false) {
-                32
-            } else {
-                clamp_gemini_thinking_budget(model_name, None)
-            };
+            let lower_model = model_name.to_lowercase();
+            let has_native_tier_level = lower_model.ends_with("-xhigh")
+                || lower_model.ends_with("-high")
+                || lower_model.ends_with("-medium")
+                || lower_model.ends_with("-low")
+                || lower_model.ends_with("-tiered")
+                || lower_model.ends_with("-sonar")
+                || lower_model.ends_with("-lite")
+                || lower_model == "gemini-3-flash";
 
             let include_thoughts = explicit_enabled
                 || explicit_budget.is_some()
                 || max_tokens.map(|m| m > 256).unwrap_or(true);
 
-            if let Some(cur_max) = gen_config.get("maxOutputTokens").and_then(|v| v.as_u64()) {
-                if cur_max <= requested_budget {
-                    let adjusted = (requested_budget + cur_max.max(8192)).min(GEMINI_MAX_OUTPUT_TOKENS);
-                    gen_config.insert("maxOutputTokens".to_string(), Value::from(adjusted));
-                }
-            }
+            if has_native_tier_level && explicit_budget.is_none() {
+                gen_config.insert(
+                    "thinkingConfig".to_string(),
+                    json!({
+                        "includeThoughts": include_thoughts
+                    }),
+                );
+            } else {
+                let requested_budget = if let Some(b) = explicit_budget {
+                    clamp_gemini_thinking_budget(model_name, Some(b))
+                } else if max_tokens.map(|m| m <= 1024).unwrap_or(false) {
+                    32
+                } else {
+                    clamp_gemini_thinking_budget(model_name, None)
+                };
 
-            gen_config.insert(
-                "thinkingConfig".to_string(),
-                json!({
-                    "includeThoughts": include_thoughts,
-                    "thinkingBudget": requested_budget
-                }),
-            );
+                if let Some(cur_max) = gen_config.get("maxOutputTokens").and_then(|v| v.as_u64()) {
+                    if cur_max <= requested_budget {
+                        let adjusted =
+                            (requested_budget + cur_max.max(8192)).min(GEMINI_MAX_OUTPUT_TOKENS);
+                        gen_config.insert("maxOutputTokens".to_string(), Value::from(adjusted));
+                    }
+                }
+
+                gen_config.insert(
+                    "thinkingConfig".to_string(),
+                    json!({
+                        "includeThoughts": include_thoughts,
+                        "thinkingBudget": requested_budget
+                    }),
+                );
+            }
         }
     }
 

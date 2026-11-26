@@ -11,7 +11,9 @@ use crate::account::rate_limits::{
 use crate::account::storage::{load_accounts, save_accounts};
 use crate::account::strategy::StrategyImpl;
 use crate::account::types::{Account, SubscriptionInfo};
-use crate::cloudcode::model_api::{clear_model_cache, get_subscription_tier, parse_tier_id};
+use crate::cloudcode::model_api::{
+    clear_model_cache, extract_ineligible_validation, get_subscription_tier, parse_tier_id,
+};
 use crate::config::get_config;
 use crate::constants::{
     antigravity_headers, client_metadata, get_strategy_label, token_refresh_interval_ms,
@@ -418,6 +420,14 @@ impl AccountManager {
         }
     }
 
+    pub async fn is_account_invalid(&self, email: &str) -> bool {
+        let inner = self.inner.read().await;
+        inner
+            .accounts
+            .iter()
+            .any(|a| a.email == email && a.is_invalid)
+    }
+
     pub async fn update_account_subscription_and_quota(
         &self,
         email: &str,
@@ -426,7 +436,17 @@ impl AccountManager {
     ) {
         {
             let mut inner = self.inner.write().await;
+            if let Some(ref pid) = sub.project_id {
+                if !pid.is_empty() && pid != DEFAULT_PROJECT_ID {
+                    inner.project_cache.insert(email.to_string(), pid.clone());
+                }
+            }
             if let Some(acc) = inner.accounts.iter_mut().find(|a| a.email == email) {
+                if let Some(ref pid) = sub.project_id {
+                    if !pid.is_empty() && pid != DEFAULT_PROJECT_ID && acc.project_id.is_none() {
+                        acc.project_id = Some(pid.clone());
+                    }
+                }
                 acc.subscription = sub;
                 acc.quota.models = quotas;
                 acc.quota.last_checked = Some(now_ms());
@@ -589,17 +609,31 @@ impl AccountManager {
         }
 
         if let Some(ref pid) = account.project_id {
-            {
-                let mut inner = self.inner.write().await;
-                inner
-                    .project_cache
-                    .insert(account.email.clone(), pid.clone());
+            if !pid.is_empty() && pid != DEFAULT_PROJECT_ID {
+                {
+                    let mut inner = self.inner.write().await;
+                    inner
+                        .project_cache
+                        .insert(account.email.clone(), pid.clone());
+                }
+                if account.subscription.tier == "unknown" {
+                    self.fetch_and_save_subscription(&account.email, token)
+                        .await;
+                }
+                return pid.clone();
             }
-            if account.subscription.tier == "unknown" {
-                self.fetch_and_save_subscription(&account.email, token)
-                    .await;
+        }
+
+        if let Some(ref pid) = account.subscription.project_id {
+            if !pid.is_empty() && pid != DEFAULT_PROJECT_ID {
+                {
+                    let mut inner = self.inner.write().await;
+                    inner
+                        .project_cache
+                        .insert(account.email.clone(), pid.clone());
+                }
+                return pid.clone();
             }
-            return pid.clone();
         }
 
         let allow_onboard = if allow_onboard_caller {
@@ -623,7 +657,18 @@ impl AccountManager {
         };
 
         let part_proj = parts.as_ref().and_then(|p| p.project_id.as_deref());
-        let (project, subscription) = discover_project(token, part_proj, allow_onboard).await;
+        let (project, subscription, validation_required) =
+            discover_project(token, part_proj, allow_onboard).await;
+
+        if let Some((_reason, verify_url)) = validation_required {
+            self.mark_invalid(
+                &account.email,
+                "Account requires verification",
+                verify_url,
+            )
+            .await;
+            return DEFAULT_PROJECT_ID.to_string();
+        }
 
         let mut needs_save = false;
         {
@@ -669,26 +714,45 @@ impl AccountManager {
         // Never trigger onboard_user here since project_id is already known.
         let sub_res = get_subscription_tier(token).await;
         let mut updated = false;
+        let mut invalid_verify_url: Option<Option<String>> = None;
 
         {
             let mut inner = self.inner.write().await;
             inner.subscription_in_flight.remove(email);
-            if let Ok((raw_tier, detected_pid)) = sub_res {
-                let tier = if raw_tier == "unknown" {
-                    "free".to_string()
-                } else {
-                    raw_tier
-                };
-                if let Some(acc) = inner.accounts.iter_mut().find(|a| a.email == email) {
-                    let final_pid = detected_pid.or_else(|| acc.subscription.project_id.clone());
-                    acc.subscription = SubscriptionInfo {
-                        tier,
-                        project_id: final_pid,
-                        detected_at: Some(Value::String(chrono::Utc::now().to_rfc3339())),
+            match sub_res {
+                Ok((raw_tier, detected_pid)) => {
+                    let tier = if raw_tier == "unknown" {
+                        "free".to_string()
+                    } else {
+                        raw_tier
                     };
-                    updated = true;
+                    if let Some(acc) = inner.accounts.iter_mut().find(|a| a.email == email) {
+                        let final_pid = detected_pid.or_else(|| acc.subscription.project_id.clone());
+                        acc.subscription = SubscriptionInfo {
+                            tier,
+                            project_id: final_pid,
+                            detected_at: Some(Value::String(chrono::Utc::now().to_rfc3339())),
+                        };
+                        updated = true;
+                    }
+                }
+                Err(err) => {
+                    if let Some(vurl_raw) = err.strip_prefix("VALIDATION_REQUIRED|") {
+                        let vurl = if vurl_raw.is_empty() {
+                            None
+                        } else {
+                            Some(vurl_raw.to_string())
+                        };
+                        invalid_verify_url = Some(vurl);
+                    }
                 }
             }
+        }
+
+        if let Some(vurl) = invalid_verify_url {
+            self.mark_invalid(email, "Account requires verification", vurl)
+                .await;
+            return;
         }
 
         if updated {
@@ -790,7 +854,11 @@ async fn discover_project(
     token: &str,
     project_id: Option<&str>,
     allow_onboard: bool,
-) -> (String, Option<SubscriptionInfo>) {
+) -> (
+    String,
+    Option<SubscriptionInfo>,
+    Option<(String, Option<String>)>,
+) {
     let mut metadata = client_metadata();
     if let Some(pid) = project_id {
         if let Some(obj) = metadata.as_object_mut() {
@@ -816,20 +884,23 @@ async fn discover_project(
                 continue;
             }
             if let Ok(data) = r.json::<Value>().await {
+                if let Some(ineligible) = extract_ineligible_validation(&data) {
+                    return (DEFAULT_PROJECT_ID.to_string(), None, Some(ineligible));
+                }
                 got_ok = true;
                 let sub = extract_subscription(&data);
                 if let Some(p) = data
                     .get("cloudaicompanionProject")
                     .and_then(|v| v.as_str())
                 {
-                    return (p.to_string(), Some(sub));
+                    return (p.to_string(), Some(sub), None);
                 }
                 if let Some(p) = data
                     .get("cloudaicompanionProject")
                     .and_then(|v| v.get("id"))
                     .and_then(|v| v.as_str())
                 {
-                    return (p.to_string(), Some(sub));
+                    return (p.to_string(), Some(sub), None);
                 }
                 load_data = Some(data);
                 break;
@@ -841,23 +912,23 @@ async fn discover_project(
         if let Some(ref data) = load_data {
             let sub = extract_subscription(data);
             if allow_onboard && project_id.is_none() {
-                let tier_id = get_default_tier_id(data.get("allowedTiers"))
-                    .unwrap_or_else(|| "free-tier".to_string());
-                if let Some(onboarded) = onboard_user(token, &tier_id, project_id).await {
-                    return (onboarded, Some(sub));
+                if let Some(tier_id) = get_default_tier_id(data.get("allowedTiers")) {
+                    if let Some(onboarded) = onboard_user(token, &tier_id, project_id).await {
+                        return (onboarded, Some(sub), None);
+                    }
                 }
             }
             if let Some(pid) = project_id {
-                return (pid.to_string(), Some(sub));
+                return (pid.to_string(), Some(sub), None);
             }
-            return (DEFAULT_PROJECT_ID.to_string(), Some(sub));
+            return (DEFAULT_PROJECT_ID.to_string(), Some(sub), None);
         }
     }
 
     if let Some(pid) = project_id {
-        (pid.to_string(), None)
+        (pid.to_string(), None, None)
     } else {
-        (DEFAULT_PROJECT_ID.to_string(), None)
+        (DEFAULT_PROJECT_ID.to_string(), None, None)
     }
 }
 
