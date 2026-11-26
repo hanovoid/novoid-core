@@ -49,6 +49,9 @@ pub async fn maybe_throttle() {
 }
 
 pub fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
     let seconds = ms / 1000;
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;

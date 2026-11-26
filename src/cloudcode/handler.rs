@@ -379,14 +379,18 @@ async fn acquire_upstream_response(
                 }
 
                 if (status == 503 || status == 529) && is_model_capacity_exhausted(&err_text) {
+                    let reset_ms = parse_reset_time(Some(&resp_headers), &err_text);
                     if capacity_retries < cfg.max_capacity_retries {
                         let tier_idx = capacity_retries
                             .min(cfg.capacity_backoff_tiers_ms.len().saturating_sub(1));
-                        let wait_ms = cfg
+                        let fallback_wait = cfg
                             .capacity_backoff_tiers_ms
                             .get(tier_idx)
                             .copied()
                             .unwrap_or(10_000);
+                        let wait_ms = reset_ms
+                            .map(|ms| ms.clamp(300, fallback_wait))
+                            .unwrap_or(fallback_wait);
                         capacity_retries += 1;
                         account_manager
                             .increment_consecutive_failures(&account.email)
@@ -406,13 +410,13 @@ async fn acquire_upstream_response(
                     account_manager
                         .mark_rate_limited(
                             &account.email,
-                            Some(BACKOFF_MODEL_CAPACITY_EXHAUSTED_MS),
+                            Some(reset_ms.unwrap_or(BACKOFF_MODEL_CAPACITY_EXHAUSTED_MS)),
                             &model,
                         )
                         .await;
                     return Err(NovoidError::CapacityExhausted {
                         message: err_text,
-                        retry_after_ms: Some(BACKOFF_MODEL_CAPACITY_EXHAUSTED_MS),
+                        retry_after_ms: Some(reset_ms.unwrap_or(BACKOFF_MODEL_CAPACITY_EXHAUSTED_MS)),
                     });
                 }
 
@@ -653,121 +657,125 @@ pub async fn send_message_stream_prepared(
     fallback_enabled: bool,
 ) -> Result<
     (
-        Value,
         String,
         Pin<Box<dyn Stream<Item = Result<Value, NovoidError>> + Send>>,
     ),
     NovoidError,
 > {
-    let (mut ready, _) =
+    let (ready, _) =
         acquire_upstream_response(anthropic_request, account_manager, true, fallback_enabled)
             .await?;
 
-    let mut empty_retries = 0usize;
-    loop {
-        let mut s = Box::pin(stream_sse_response(
-            ready.response,
-            ready.model.clone(),
-        ));
+    let actual_model = ready.model.clone();
+    let am = Arc::clone(account_manager);
 
-        match s.next().await {
-            Some(Ok(first_event)) => {
-                let am = Arc::clone(account_manager);
-                let email = ready.account_email.clone();
-                let model_name = ready.model.clone();
-                let tail_stream: Pin<Box<dyn Stream<Item = Result<Value, NovoidError>> + Send>> =
-                    Box::pin(try_stream! {
+    let stream: Pin<Box<dyn Stream<Item = Result<Value, NovoidError>> + Send>> =
+        Box::pin(try_stream! {
+            let mut empty_retries = 0usize;
+            let mut cur_response = Some(ready.response);
+            while let Some(resp_to_stream) = cur_response.take() {
+                let mut s = Box::pin(stream_sse_response(
+                    resp_to_stream,
+                    ready.model.clone(),
+                ));
+
+                match s.next().await {
+                    Some(Ok(first_event)) => {
+                        let email = ready.account_email.clone();
+                        let model_name = ready.model.clone();
+                        yield first_event;
                         while let Some(ev_res) = s.next().await {
                             let ev = ev_res?;
                             yield ev;
                         }
                         clear_rate_limit_state(&email, &model_name);
                         am.notify_success(&email).await;
-                    });
-                return Ok((first_event, ready.model, tail_stream));
-            }
-            Some(Err(NovoidError::EmptyResponse)) | None => {
-                if empty_retries >= MAX_EMPTY_RESPONSE_RETRIES {
-                    logger().error(format!(
-                        "[CloudCode] Empty response after {MAX_EMPTY_RESPONSE_RETRIES} retries"
-                    ));
-                    let mut events = empty_response_fallback_events(&ready.model);
-                    let first = events.remove(0);
-                    let tail: Pin<Box<dyn Stream<Item = Result<Value, NovoidError>> + Send>> =
-                        Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)));
-                    return Ok((first, ready.model, tail));
-                }
-
-                let backoff_ms = 500 * (1u64 << empty_retries);
-                empty_retries += 1;
-                logger().warn(format!(
-                    "[CloudCode] Empty response, retry {empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES} after {backoff_ms}ms..."
-                ));
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-
-                maybe_throttle().await;
-                let retry_resp = http_client()
-                    .post(&ready.endpoint_url)
-                    .bearer_auth(&ready.token)
-                    .headers(build_headers(
-                        &ready.model,
-                        "text/event-stream",
-                        Some(&ready.session_id),
-                    ))
-                    .json(&ready.payload)
-                    .send()
-                    .await
-                    .map_err(|e| NovoidError::Network {
-                        message: e.to_string(),
-                    })?;
-
-                let status = retry_resp.status().as_u16();
-                if status >= 400 {
-                    let hdrs = retry_resp.headers().clone();
-                    let text = retry_resp.text().await.unwrap_or_default();
-                    if status == 429 {
-                        let rms = parse_reset_time(Some(&hdrs), &text);
-                        account_manager
-                            .mark_rate_limited(&ready.account_email, rms, &ready.model)
-                            .await;
-                        return Err(NovoidError::RateLimited {
-                            message: text,
-                            reset_ms: rms,
-                            account_email: Some(ready.account_email),
-                            is_dedup: false,
-                        });
+                        break;
                     }
-                    if status == 401 {
-                        if is_permanent_auth_failure(&text) {
-                            account_manager
-                                .mark_invalid(
-                                    &ready.account_email,
-                                    "Token revoked - re-authentication required",
-                                    None,
-                                )
-                                .await;
-                            return Err(NovoidError::AuthInvalidPermanent {
-                                message: text,
-                                account_email: Some(ready.account_email),
-                            });
+                    Some(Err(NovoidError::EmptyResponse)) | None => {
+                        if empty_retries >= MAX_EMPTY_RESPONSE_RETRIES {
+                            logger().error(format!(
+                                "[CloudCode] Empty response after {MAX_EMPTY_RESPONSE_RETRIES} retries"
+                            ));
+                            for ev in empty_response_fallback_events(&ready.model) {
+                                yield ev;
+                            }
+                            break;
                         }
-                        account_manager
-                            .clear_token_cache(Some(&ready.account_email))
-                            .await;
-                        return Err(NovoidError::AuthInvalid {
-                            message: text,
-                            account_email: Some(ready.account_email),
-                        });
-                    }
-                    return Err(NovoidError::UpstreamApi {
-                        status_code: status,
-                        message: text,
-                    });
-                }
 
-                ready.response = retry_resp;
+                        let backoff_ms = 500 * (1u64 << empty_retries);
+                        empty_retries += 1;
+                        logger().warn(format!(
+                            "[CloudCode] Empty response, retry {empty_retries}/{MAX_EMPTY_RESPONSE_RETRIES} after {backoff_ms}ms..."
+                        ));
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+
+                        maybe_throttle().await;
+                        let retry_resp = http_client()
+                            .post(&ready.endpoint_url)
+                            .bearer_auth(&ready.token)
+                            .headers(build_headers(
+                                &ready.model,
+                                "text/event-stream",
+                                Some(&ready.session_id),
+                            ))
+                            .json(&ready.payload)
+                            .send()
+                            .await
+                            .map_err(|e| NovoidError::Network {
+                                message: e.to_string(),
+                            })?;
+
+                        let status = retry_resp.status().as_u16();
+                        if status >= 400 {
+                            let hdrs = retry_resp.headers().clone();
+                            let text = retry_resp.text().await.unwrap_or_default();
+                            let err = if status == 429 {
+                                let rms = parse_reset_time(Some(&hdrs), &text);
+                                am.mark_rate_limited(&ready.account_email, rms, &ready.model)
+                                    .await;
+                                NovoidError::RateLimited {
+                                    message: text,
+                                    reset_ms: rms,
+                                    account_email: Some(ready.account_email.clone()),
+                                    is_dedup: false,
+                                }
+                            } else if status == 401 {
+                                if is_permanent_auth_failure(&text) {
+                                    am.mark_invalid(
+                                        &ready.account_email,
+                                        "Token revoked - re-authentication required",
+                                        None,
+                                    )
+                                    .await;
+                                    NovoidError::AuthInvalidPermanent {
+                                        message: text,
+                                        account_email: Some(ready.account_email.clone()),
+                                    }
+                                } else {
+                                    am.clear_token_cache(Some(&ready.account_email)).await;
+                                    NovoidError::AuthInvalid {
+                                        message: text,
+                                        account_email: Some(ready.account_email.clone()),
+                                    }
+                                }
+                            } else {
+                                NovoidError::UpstreamApi {
+                                    status_code: status,
+                                    message: text,
+                                }
+                            };
+                            Err(err)?;
+                        } else {
+                            cur_response = Some(retry_resp);
+                        }
+                    }
+                    Some(Err(err)) => {
+                        Err(err)?;
+                    }
+                }
             }
-            Some(Err(err)) => return Err(err),
-        }
-    }
+        });
+
+    Ok((actual_model, stream))
 }

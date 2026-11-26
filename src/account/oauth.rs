@@ -432,10 +432,13 @@ pub async fn onboard_user(
                     }
                 }
                 Ok(r) => {
+                    let st = r.status();
                     logger().warn(format!(
-                        "[Onboarding] onboardUser failed at {endpoint}: {}",
-                        r.status()
+                        "[Onboarding] onboardUser failed at {endpoint}: {st}"
                     ));
+                    if st.as_u16() == 429 {
+                        return None;
+                    }
                     break;
                 }
                 Err(err) => {

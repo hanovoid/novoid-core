@@ -405,7 +405,7 @@ async fn handle_messages(
 
     if is_stream {
         match send_message_stream_prepared(&body, &state.account_manager, effective_fallback).await {
-            Ok((first_event, actual_model, mut tail_stream)) => {
+            Ok((actual_model, mut tail_stream)) => {
                 usage_stats::track(&actual_model);
 
                 let sse_stream = async_stream::stream! {
@@ -415,17 +415,28 @@ async fn handle_messages(
                         Bytes::from(format!("event: {ev_type}\ndata: {data_str}\n\n"))
                     };
 
-                    yield Ok::<Bytes, std::convert::Infallible>(format_sse(&first_event));
+                    // Immediately flush an SSE comment frame so clients/proxies receive HTTP 200 headers right away
+                    yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b": keepalive\n\n"));
 
-                    while let Some(item) = tail_stream.next().await {
-                        match item {
-                            Ok(ev) => yield Ok(format_sse(&ev)),
-                            Err(err) => {
+                    loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            tail_stream.next(),
+                        )
+                        .await
+                        {
+                            Ok(Some(Ok(ev))) => yield Ok(format_sse(&ev)),
+                            Ok(Some(Err(err))) => {
                                 logger().error(format!("[API] Mid-stream error: {err}"));
                                 let (_, err_json) = err.to_anthropic_response();
                                 let data_str = serde_json::to_string(&err_json).unwrap_or_default();
                                 yield Ok(Bytes::from(format!("event: error\ndata: {data_str}\n\n")));
                                 break;
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                // Keep SSE connection active while upstream thinking model computes first chunk
+                                yield Ok(Bytes::from_static(b": keepalive\n\n"));
                             }
                         }
                     }

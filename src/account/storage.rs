@@ -37,6 +37,48 @@ pub async fn load_accounts(config_path: &Path) -> AccountsFile {
             }
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(env_raw) = std::env::var("NOVOID_ACCOUNTS_JSON")
+                .ok()
+                .or_else(|| std::env::var("ACCOUNTS_JSON").ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let parsed_opt = serde_json::from_str::<AccountsFile>(&env_raw)
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_str::<Vec<Account>>(&env_raw)
+                            .ok()
+                            .map(|accounts| AccountsFile {
+                                accounts,
+                                settings: HashMap::new(),
+                                active_index: 0,
+                            })
+                    });
+                if let Some(mut seeded) = parsed_opt {
+                    for acc in &mut seeded.accounts {
+                        if acc.verify_url.is_none() {
+                            acc.is_invalid = false;
+                            acc.invalid_reason = None;
+                        }
+                    }
+                    if seeded.active_index >= seeded.accounts.len() {
+                        seeded.active_index = 0;
+                    }
+                    save_accounts(
+                        config_path,
+                        &seeded.accounts,
+                        &seeded.settings,
+                        seeded.active_index,
+                    )
+                    .await;
+                    logger().info(format!(
+                        "[AccountManager] Seeded {} account(s) from environment into {}",
+                        seeded.accounts.len(),
+                        config_path.display()
+                    ));
+                    return seeded;
+                }
+            }
             logger().info(format!(
                 "[AccountManager] No accounts file found at {}. Add accounts via WebUI or CLI.",
                 config_path.display()

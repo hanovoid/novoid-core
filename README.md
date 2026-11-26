@@ -63,6 +63,24 @@ novoid-core/
 
 ---
 
+## 📚 Tài liệu kỹ thuật đầy đủ
+
+Bộ tài liệu chi tiết cho từng file, module, API và luồng dữ liệu nằm trong [`docs/`](docs/README.md):
+
+| Tài liệu | Nội dung |
+| :--- | :--- |
+| [01 — Architecture](docs/01-architecture.md) | Kiến trúc, sơ đồ Mermaid, vòng đời request & luồng trạng thái |
+| [02 — Getting Started](docs/02-getting-started.md) | Build, CLI, daemon, kết nối client |
+| [03 — Configuration](docs/03-configuration.md) | `config.json`, defaults, env vars, presets, paths |
+| [04 — API Reference](docs/04-api-reference.md) | Toàn bộ route `/v1/*`, `/api/*`, OAuth & lỗi |
+| [05 — Account Management](docs/05-account-management.md) | OAuth PKCE, chiến lược, tracker, cooldown/quota |
+| [06 — Cloud Code & Format](docs/06-cloudcode-and-format.md) | Upstream retry, SSE, protocol conversion, schema & thinking |
+| [07 — WebUI](docs/07-webui.md) | Alpine stores, components, views, translations |
+| [08 — Module Map](docs/08-module-map.md) | Tham chiếu từng file/thư mục trong repository |
+| [09 — Operations](docs/09-operations.md) | Deploy, giám sát, xử lý sự cố thực tế |
+
+---
+
 ## 🎯 Chiến lược cân bằng tải & Endpoints
 
 ### 3 chiến lược chọn tài khoản (`--strategy`)

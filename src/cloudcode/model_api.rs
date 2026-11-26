@@ -269,7 +269,27 @@ pub async fn list_models_for_accounts(
     account_manager: &Arc<AccountManager>,
     force_refresh: bool,
 ) -> Value {
-    populate_model_cache_for_accounts(account_manager, force_refresh).await;
+    if !force_refresh {
+        let (has_cached, is_stale) = {
+            let guard = model_cache().read().await;
+            (
+                !guard.model_entries.is_empty(),
+                now_ms().saturating_sub(guard.last_fetched) >= MODEL_VALIDATION_CACHE_TTL_MS,
+            )
+        };
+        if has_cached {
+            if is_stale {
+                let am = Arc::clone(account_manager);
+                tokio::spawn(async move {
+                    populate_model_cache_for_accounts(&am, false).await;
+                });
+            }
+        } else {
+            populate_model_cache_for_accounts(account_manager, false).await;
+        }
+    } else {
+        populate_model_cache_for_accounts(account_manager, true).await;
+    }
 
     let created = (now_ms() / 1000) as u64;
     let guard = model_cache().read().await;
@@ -442,6 +462,23 @@ pub async fn get_subscription_tier(token: &str) -> Result<(String, Option<String
 }
 
 pub async fn is_valid_model(model_id: &str, account_manager: &Arc<AccountManager>) -> bool {
+    {
+        let guard = model_cache().read().await;
+        if !guard.valid_models.is_empty() {
+            let is_stale =
+                now_ms().saturating_sub(guard.last_fetched) >= MODEL_VALIDATION_CACHE_TTL_MS;
+            let valid = guard.valid_models.contains(model_id);
+            drop(guard);
+            if is_stale {
+                let am = Arc::clone(account_manager);
+                tokio::spawn(async move {
+                    populate_model_cache_for_accounts(&am, false).await;
+                });
+            }
+            return valid;
+        }
+    }
+
     populate_model_cache_for_accounts(account_manager, false).await;
     let guard = model_cache().read().await;
     if guard.valid_models.is_empty() {

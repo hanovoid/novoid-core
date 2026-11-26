@@ -11,7 +11,7 @@ use crate::account::rate_limits::{
 use crate::account::storage::{load_accounts, save_accounts};
 use crate::account::strategy::StrategyImpl;
 use crate::account::types::{Account, SubscriptionInfo};
-use crate::cloudcode::model_api::{clear_model_cache, parse_tier_id};
+use crate::cloudcode::model_api::{clear_model_cache, get_subscription_tier, parse_tier_id};
 use crate::config::get_config;
 use crate::constants::{
     antigravity_headers, client_metadata, get_strategy_label, token_refresh_interval_ms,
@@ -41,6 +41,8 @@ struct PoolInner {
     token_cache: HashMap<String, CachedToken>,
     project_cache: HashMap<String, String>,
     subscription_in_flight: HashSet<String>,
+    onboard_attempted_at: HashMap<String, u64>,
+    last_select_save_ms: u64,
 }
 
 pub struct AccountManager {
@@ -80,6 +82,8 @@ impl AccountManager {
                 token_cache: HashMap::new(),
                 project_cache: HashMap::new(),
                 subscription_in_flight: HashSet::new(),
+                onboard_attempted_at: HashMap::new(),
+                last_select_save_ms: 0,
             }),
         }
     }
@@ -289,7 +293,7 @@ impl AccountManager {
     }
 
     pub async fn select_account(&self, model_id: &str) -> (Option<Account>, u64) {
-        let (acc, wait_ms, should_save) = {
+        let (acc, wait_ms, bg_snapshot) = {
             let mut inner = self.inner.write().await;
             let cur_idx = inner.current_index;
             let PoolInner {
@@ -300,10 +304,26 @@ impl AccountManager {
             let res = strategy.select_account(accounts, model_id, cur_idx);
             inner.current_index = res.new_cursor;
             let acc = res.index.map(|i| inner.accounts[i].clone());
-            (acc, res.wait_ms, res.index.is_some())
+            let now = now_ms();
+            let snapshot = if res.index.is_some()
+                && now.saturating_sub(inner.last_select_save_ms) >= 5_000
+            {
+                inner.last_select_save_ms = now;
+                Some((
+                    self.config_path.clone(),
+                    inner.accounts.clone(),
+                    inner.settings.clone(),
+                    inner.current_index,
+                ))
+            } else {
+                None
+            };
+            (acc, res.wait_ms, snapshot)
         };
-        if should_save {
-            self.save_to_disk().await;
+        if let Some((path, accounts, settings, idx)) = bg_snapshot {
+            tokio::spawn(async move {
+                save_accounts(&path, &accounts, &settings, idx).await;
+            });
         }
         (acc, wait_ms)
     }
@@ -551,7 +571,7 @@ impl AccountManager {
                         .insert(account.email.clone(), managed.clone());
                 }
                 if account.subscription.tier == "unknown" {
-                    self.fetch_and_save_subscription(&account.email, token, account.project_id.as_deref())
+                    self.fetch_and_save_subscription(&account.email, token)
                         .await;
                 }
                 return managed.clone();
@@ -566,14 +586,29 @@ impl AccountManager {
                     .insert(account.email.clone(), pid.clone());
             }
             if account.subscription.tier == "unknown" {
-                self.fetch_and_save_subscription(&account.email, token, Some(pid))
+                self.fetch_and_save_subscription(&account.email, token)
                     .await;
             }
             return pid.clone();
         }
 
+        let allow_onboard = {
+            let inner = self.inner.read().await;
+            inner
+                .onboard_attempted_at
+                .get(&account.email)
+                .map(|&ts| now_ms().saturating_sub(ts) >= 10 * 60 * 1000)
+                .unwrap_or(true)
+        };
+        if allow_onboard {
+            let mut inner = self.inner.write().await;
+            inner
+                .onboard_attempted_at
+                .insert(account.email.clone(), now_ms());
+        }
+
         let part_proj = parts.as_ref().and_then(|p| p.project_id.as_deref());
-        let (project, subscription) = discover_project(token, part_proj).await;
+        let (project, subscription) = discover_project(token, part_proj, allow_onboard).await;
 
         let mut needs_save = false;
         {
@@ -608,12 +643,7 @@ impl AccountManager {
         project
     }
 
-    async fn fetch_and_save_subscription(
-        &self,
-        email: &str,
-        token: &str,
-        project_id: Option<&str>,
-    ) {
+    async fn fetch_and_save_subscription(&self, email: &str, token: &str) {
         {
             let mut inner = self.inner.write().await;
             if !inner.subscription_in_flight.insert(email.to_string()) {
@@ -621,18 +651,27 @@ impl AccountManager {
             }
         }
 
-        let (_, subscription) = discover_project(token, project_id).await;
+        // Never trigger onboard_user here since project_id is already known.
+        let sub_res = get_subscription_tier(token).await;
         let mut updated = false;
 
         {
             let mut inner = self.inner.write().await;
             inner.subscription_in_flight.remove(email);
-            if let Some(sub) = subscription {
-                if sub.tier != "unknown" {
-                    if let Some(acc) = inner.accounts.iter_mut().find(|a| a.email == email) {
-                        acc.subscription = sub;
-                        updated = true;
-                    }
+            if let Ok((raw_tier, detected_pid)) = sub_res {
+                let tier = if raw_tier == "unknown" {
+                    "free".to_string()
+                } else {
+                    raw_tier
+                };
+                if let Some(acc) = inner.accounts.iter_mut().find(|a| a.email == email) {
+                    let final_pid = detected_pid.or_else(|| acc.subscription.project_id.clone());
+                    acc.subscription = SubscriptionInfo {
+                        tier,
+                        project_id: final_pid,
+                        detected_at: Some(Value::String(chrono::Utc::now().to_rfc3339())),
+                    };
+                    updated = true;
                 }
             }
         }
@@ -735,6 +774,7 @@ impl AccountManager {
 async fn discover_project(
     token: &str,
     project_id: Option<&str>,
+    allow_onboard: bool,
 ) -> (String, Option<SubscriptionInfo>) {
     let mut metadata = client_metadata();
     if let Some(pid) = project_id {
@@ -784,12 +824,18 @@ async fn discover_project(
 
     if got_ok {
         if let Some(ref data) = load_data {
-            let tier_id = get_default_tier_id(data.get("allowedTiers"))
-                .unwrap_or_else(|| "free-tier".to_string());
-            if let Some(onboarded) = onboard_user(token, &tier_id, project_id).await {
-                let sub = extract_subscription(data);
-                return (onboarded, Some(sub));
+            let sub = extract_subscription(data);
+            if allow_onboard && project_id.is_none() {
+                let tier_id = get_default_tier_id(data.get("allowedTiers"))
+                    .unwrap_or_else(|| "free-tier".to_string());
+                if let Some(onboarded) = onboard_user(token, &tier_id, project_id).await {
+                    return (onboarded, Some(sub));
+                }
             }
+            if let Some(pid) = project_id {
+                return (pid.to_string(), Some(sub));
+            }
+            return (DEFAULT_PROJECT_ID.to_string(), Some(sub));
         }
     }
 
