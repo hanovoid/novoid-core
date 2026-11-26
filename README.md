@@ -133,4 +133,4 @@ export ANTHROPIC_API_KEY="dummy"
 claude
 ```
 
-👉 Nếu bạn cần triển khai **hệ thống 2 tầng kèm Model Router (`novoid-*`) và script cài đặt cho 6 AI Coding CLI** (OpenCode, Claude Code, Aider, Goose, Codex CLI, Crush), xem thêm tại **[`hanovoid/antigravity-cloud`](https://github.com/hanovoid/novoid-proxy)**.
+👉 Nếu bạn cần triển khai **hệ thống 2 tầng kèm Model Router (`novoid-*`) và script cài đặt cho 6 AI Coding CLI** (OpenCode, Claude Code, Aider, Goose, Codex CLI, Crush), xem thêm tại **[`hanovoid/novoid-proxy`](https://github.com/hanovoid/novoid-proxy)**.
