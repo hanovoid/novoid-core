@@ -251,22 +251,6 @@ async fn handle_list_models(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     state.account_manager.ensure_initialized().await;
-    let all = state.account_manager.get_all_accounts().await;
-    let enabled_count = all.iter().filter(|a| !a.is_invalid && a.enabled).count();
-    if enabled_count == 0 {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "type": "api_error",
-                    "message": "No accounts available"
-                }
-            })),
-        )
-            .into_response();
-    }
-
     let force_refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
     let models = list_models_for_accounts(&state.account_manager, force_refresh).await;
     Json(models).into_response()

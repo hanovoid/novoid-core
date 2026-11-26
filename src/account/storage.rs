@@ -79,6 +79,47 @@ pub async fn load_accounts(config_path: &Path) -> AccountsFile {
                     return seeded;
                 }
             }
+
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let fallback_paths = [
+                std::path::PathBuf::from("/data/accounts.json"),
+                std::path::PathBuf::from("/app/data/accounts.json"),
+                home.join(".config/antigravity-proxy/accounts.json"),
+            ];
+            for fb in &fallback_paths {
+                if fb != config_path && fb.exists() {
+                    if let Ok(content) = fs::read_to_string(fb).await {
+                        if let Ok(mut parsed) = serde_json::from_str::<AccountsFile>(&content) {
+                            if !parsed.accounts.is_empty() {
+                                for acc in &mut parsed.accounts {
+                                    if acc.verify_url.is_none() {
+                                        acc.is_invalid = false;
+                                        acc.invalid_reason = None;
+                                    }
+                                }
+                                if parsed.active_index >= parsed.accounts.len() {
+                                    parsed.active_index = 0;
+                                }
+                                save_accounts(
+                                    config_path,
+                                    &parsed.accounts,
+                                    &parsed.settings,
+                                    parsed.active_index,
+                                )
+                                .await;
+                                logger().info(format!(
+                                    "[AccountManager] Migrated {} account(s) from {} to {}",
+                                    parsed.accounts.len(),
+                                    fb.display(),
+                                    config_path.display()
+                                ));
+                                return parsed;
+                            }
+                        }
+                    }
+                }
+            }
+
             logger().info(format!(
                 "[AccountManager] No accounts file found at {}. Add accounts via WebUI or CLI.",
                 config_path.display()

@@ -268,30 +268,73 @@ pub async fn populate_model_cache_for_accounts(
     }
 }
 
+const BUILTIN_FALLBACK_MODELS: &[&str] = &[
+    "claude-opus-4-6-thinking",
+    "claude-opus-5-5-high",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5-5-high",
+    "claude-sonnet-5-5-low",
+    "claude-sonnet-5-5-medium",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash-thinking",
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash-high",
+    "gemini-3.8-flash-low",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-tiered",
+    "gemini-4-argon-high",
+    "gemini-4-argon-low",
+    "gemini-4-argon-medium",
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-low",
+    "gemini-4-carbon-medium",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-low",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-sonar",
+    "gemini-4-hydrogen-tiered-high",
+    "gemini-4-hydrogen-tiered-xhigh",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-neon-high",
+    "gemini-4-neon-low",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-xhigh",
+];
+
 pub async fn list_models_for_accounts(
     account_manager: &Arc<AccountManager>,
     force_refresh: bool,
 ) -> Value {
-    if !force_refresh {
-        let (has_cached, is_stale) = {
-            let guard = model_cache().read().await;
-            (
-                !guard.model_entries.is_empty(),
-                now_ms().saturating_sub(guard.last_fetched) >= MODEL_VALIDATION_CACHE_TTL_MS,
-            )
-        };
-        if has_cached {
-            if is_stale {
-                let am = Arc::clone(account_manager);
-                tokio::spawn(async move {
-                    populate_model_cache_for_accounts(&am, false).await;
-                });
+    let all_accounts = account_manager.get_all_accounts().await;
+    let has_enabled = all_accounts.iter().any(|a| !a.is_invalid && a.enabled);
+
+    if has_enabled {
+        if !force_refresh {
+            let (has_cached, is_stale) = {
+                let guard = model_cache().read().await;
+                (
+                    !guard.model_entries.is_empty(),
+                    now_ms().saturating_sub(guard.last_fetched) >= MODEL_VALIDATION_CACHE_TTL_MS,
+                )
+            };
+            if has_cached {
+                if is_stale {
+                    let am = Arc::clone(account_manager);
+                    tokio::spawn(async move {
+                        populate_model_cache_for_accounts(&am, false).await;
+                    });
+                }
+            } else {
+                populate_model_cache_for_accounts(account_manager, false).await;
             }
         } else {
-            populate_model_cache_for_accounts(account_manager, false).await;
+            populate_model_cache_for_accounts(account_manager, true).await;
         }
-    } else {
-        populate_model_cache_for_accounts(account_manager, true).await;
     }
 
     let created = (now_ms() / 1000) as u64;
@@ -303,6 +346,27 @@ pub async fn list_models_for_accounts(
         .filter(|(id, _)| !is_hidden_model(id))
         .map(|(id, data)| (id.clone(), data.clone()))
         .collect();
+
+    if items.is_empty() {
+        let mut from_saved = HashSet::new();
+        for acc in &all_accounts {
+            for mid in acc.quota.models.keys() {
+                if is_supported_model(mid) && !is_hidden_model(mid) {
+                    from_saved.insert(mid.clone());
+                }
+            }
+        }
+        if !from_saved.is_empty() {
+            for mid in from_saved {
+                items.push((mid.clone(), json!({ "displayName": mid })));
+            }
+        } else {
+            for &mid in BUILTIN_FALLBACK_MODELS {
+                items.push((mid.to_string(), json!({ "displayName": mid })));
+            }
+        }
+    }
+
     items.sort_by(|a, b| a.0.cmp(&b.0));
 
     let list: Vec<Value> = items
