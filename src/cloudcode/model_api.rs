@@ -204,7 +204,10 @@ pub async fn populate_model_cache_for_accounts(
                 .clone()
                 .or_else(|| acc.project_id.clone());
             if project_id.is_none() {
-                project_id = Some(am.get_project_for_account(&acc, &token).await);
+                project_id = Some(
+                    am.get_project_for_account_with_onboard(&acc, &token, false)
+                        .await,
+                );
             }
             let data = fetch_available_models(&token, project_id.as_deref())
                 .await

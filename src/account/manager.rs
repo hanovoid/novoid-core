@@ -550,6 +550,16 @@ impl AccountManager {
     }
 
     pub async fn get_project_for_account(&self, account: &Account, token: &str) -> String {
+        self.get_project_for_account_with_onboard(account, token, true)
+            .await
+    }
+
+    pub async fn get_project_for_account_with_onboard(
+        &self,
+        account: &Account,
+        token: &str,
+        allow_onboard_caller: bool,
+    ) -> String {
         {
             let inner = self.inner.read().await;
             if let Some(pid) = inner.project_cache.get(&account.email) {
@@ -592,20 +602,25 @@ impl AccountManager {
             return pid.clone();
         }
 
-        let allow_onboard = {
-            let inner = self.inner.read().await;
-            inner
-                .onboard_attempted_at
-                .get(&account.email)
-                .map(|&ts| now_ms().saturating_sub(ts) >= 10 * 60 * 1000)
-                .unwrap_or(true)
+        let allow_onboard = if allow_onboard_caller {
+            let can = {
+                let inner = self.inner.read().await;
+                inner
+                    .onboard_attempted_at
+                    .get(&account.email)
+                    .map(|&ts| now_ms().saturating_sub(ts) >= 10 * 60 * 1000)
+                    .unwrap_or(true)
+            };
+            if can {
+                let mut inner = self.inner.write().await;
+                inner
+                    .onboard_attempted_at
+                    .insert(account.email.clone(), now_ms());
+            }
+            can
+        } else {
+            false
         };
-        if allow_onboard {
-            let mut inner = self.inner.write().await;
-            inner
-                .onboard_attempted_at
-                .insert(account.email.clone(), now_ms());
-        }
 
         let part_proj = parts.as_ref().and_then(|p| p.project_id.as_deref());
         let (project, subscription) = discover_project(token, part_proj, allow_onboard).await;
@@ -615,16 +630,14 @@ impl AccountManager {
             let mut inner = self.inner.write().await;
             if let Some(acc) = inner.accounts.iter_mut().find(|a| a.email == account.email) {
                 if project != DEFAULT_PROJECT_ID {
+                    acc.project_id = Some(project.clone());
+                    needs_save = true;
                     if let Some(ref p) = parts {
                         acc.refresh_token = Some(format_refresh_parts(
                             &p.refresh_token,
                             p.project_id.as_deref(),
                             Some(&project),
                         ));
-                        needs_save = true;
-                    } else if acc.source == "manual" {
-                        acc.project_id = Some(project.clone());
-                        needs_save = true;
                     }
                 }
                 if let Some(sub) = subscription {
@@ -632,9 +645,11 @@ impl AccountManager {
                     needs_save = true;
                 }
             }
-            inner
-                .project_cache
-                .insert(account.email.clone(), project.clone());
+            if project != DEFAULT_PROJECT_ID || allow_onboard_caller {
+                inner
+                    .project_cache
+                    .insert(account.email.clone(), project.clone());
+            }
         }
 
         if needs_save {

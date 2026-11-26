@@ -17,10 +17,25 @@ use rand::RngCore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
 use url::Url;
+
+static ONBOARD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ONBOARD_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn onboard_lock() -> &'static Mutex<()> {
+    ONBOARD_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub struct RefreshParts {
     pub refresh_token: String,
@@ -386,6 +401,16 @@ pub async fn onboard_user(
     tier_id: &str,
     project_id: Option<&str>,
 ) -> Option<String> {
+    let now = now_epoch_ms();
+    if now < ONBOARD_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed) {
+        return None;
+    }
+    let _guard = onboard_lock().lock().await;
+    let now = now_epoch_ms();
+    if now < ONBOARD_COOLDOWN_UNTIL_MS.load(Ordering::Relaxed) {
+        return None;
+    }
+
     let mut metadata = client_metadata();
     if let Some(pid) = project_id {
         if let Some(obj) = metadata.as_object_mut() {
@@ -398,7 +423,7 @@ pub async fn onboard_user(
     });
 
     for endpoint in ONBOARD_USER_ENDPOINTS {
-        for attempt in 0..10 {
+        for attempt in 0..3 {
             maybe_throttle().await;
             let resp = http_client()
                 .post(format!("{endpoint}/v1internal:onboardUser"))
@@ -426,8 +451,8 @@ pub async fn onboard_user(
                                 return Some(pid.to_string());
                             }
                         }
-                        if attempt < 9 {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         }
                     }
                 }
@@ -437,6 +462,8 @@ pub async fn onboard_user(
                         "[Onboarding] onboardUser failed at {endpoint}: {st}"
                     ));
                     if st.as_u16() == 429 {
+                        ONBOARD_COOLDOWN_UNTIL_MS
+                            .store(now_epoch_ms() + 120_000, Ordering::Relaxed);
                         return None;
                     }
                     break;

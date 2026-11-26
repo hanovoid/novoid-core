@@ -365,6 +365,14 @@ async fn export_accounts() -> Json<Value> {
             if let Some(ak) = a.api_key {
                 obj.insert("api_key".to_string(), Value::String(ak));
             }
+            if let Some(pid) = a.project_id {
+                obj.insert("projectId".to_string(), Value::String(pid));
+            }
+            if a.subscription.tier != "unknown" || a.subscription.project_id.is_some() {
+                if let Ok(sub_val) = serde_json::to_value(&a.subscription) {
+                    obj.insert("subscription".to_string(), sub_val);
+                }
+            }
             Value::Object(obj)
         })
         .collect();
@@ -391,9 +399,9 @@ async fn import_accounts(
             .into_response();
     }
 
-    let existing = load_accounts(&account_config_path()).await;
-    let existing_emails: std::collections::HashSet<String> =
-        existing.accounts.into_iter().map(|a| a.email).collect();
+    let path = account_config_path();
+    let mut loaded = load_accounts(&path).await;
+    let max_accounts = get_config().max_accounts;
 
     let mut added = Vec::new();
     let mut updated = Vec::new();
@@ -420,22 +428,77 @@ async fn import_accounts(
             continue;
         }
 
+        let pid = acc
+            .get("project_id")
+            .or_else(|| acc.get("projectId"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let sub = acc
+            .get("subscription")
+            .and_then(|v| serde_json::from_value::<crate::account::types::SubscriptionInfo>(v.clone()).ok());
+        let enabled = acc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
         let source = if ak.is_some() { "manual" } else { "oauth" };
-        let exists = existing_emails.contains(email);
-        match add_or_update_account(email.to_string(), rt, ak, None, source).await {
-            Ok(()) => {
-                if exists {
-                    updated.push(email.to_string());
-                } else {
-                    added.push(email.to_string());
-                }
+
+        if let Some(existing) = loaded.accounts.iter_mut().find(|a| a.email == email) {
+            existing.source = source.to_string();
+            if let Some(rt_val) = rt {
+                existing.refresh_token = Some(rt_val);
             }
-            Err(err) => failed.push(json!({ "email": email, "reason": err })),
+            if let Some(ak_val) = ak {
+                existing.api_key = Some(ak_val);
+            }
+            if let Some(pid_val) = pid {
+                existing.project_id = Some(pid_val);
+            }
+            if let Some(sub_val) = sub {
+                existing.subscription = sub_val;
+            }
+            existing.enabled = enabled;
+            existing.is_invalid = false;
+            existing.invalid_reason = None;
+            existing.verify_url = None;
+            if existing.added_at.is_none() {
+                existing.added_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            updated.push(email.to_string());
+            logger().info(format!("[WebUI] Account {email} updated"));
+        } else {
+            if loaded.accounts.len() >= max_accounts {
+                failed.push(json!({
+                    "email": email,
+                    "reason": format!("Maximum of {max_accounts} accounts reached. Update maxAccounts in config to increase the limit.")
+                }));
+                continue;
+            }
+            let mut new_acc = Account::default();
+            new_acc.email = email.to_string();
+            new_acc.source = source.to_string();
+            new_acc.refresh_token = rt;
+            new_acc.api_key = ak;
+            new_acc.project_id = pid;
+            if let Some(sub_val) = sub {
+                new_acc.subscription = sub_val;
+            }
+            new_acc.enabled = enabled;
+            new_acc.added_at = Some(chrono::Utc::now().to_rfc3339());
+            loaded.accounts.push(new_acc);
+            added.push(email.to_string());
+            logger().info(format!("[WebUI] Account {email} added"));
         }
+    }
+
+    if !added.is_empty() || !updated.is_empty() {
+        save_accounts(&path, &loaded.accounts, &loaded.settings, loaded.active_index).await;
     }
 
     state.account_manager.reload().await;
     crate::server::invalidate_limits_cache().await;
+
+    let am = Arc::clone(&state.account_manager);
+    tokio::spawn(async move {
+        crate::cloudcode::model_api::populate_model_cache_for_accounts(&am, true).await;
+    });
 
     Json(json!({
         "status": "ok",
